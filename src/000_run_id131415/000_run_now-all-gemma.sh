@@ -5,7 +5,6 @@ gpu_id=$1
 # src/1_run_analyze_itm.sh $gpu_id "gemma-2b-it" "DAP" 8 200 50
 
 
-
 adversarial_method_name_array=(
     # "DAP"
     # "DeepInception"
