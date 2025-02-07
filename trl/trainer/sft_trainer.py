@@ -13,9 +13,12 @@
 # limitations under the License.
 import dataclasses
 import inspect
+import math
+import random
 import os
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple, Union
+from itertools import product
 
 import datasets
 import torch
@@ -24,6 +27,7 @@ from accelerate.state import PartialState
 from datasets import Dataset
 from datasets.arrow_writer import SchemaInferenceError
 from datasets.builder import DatasetGenerationError
+from huggingface_hub.utils._deprecation import _deprecate_arguments
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -49,6 +53,11 @@ from .utils import (
     DataCollatorForCompletionOnlyLM,
     generate_model_card,
     peft_module_casting_to_bf16,
+    load_trainable_neurons,
+    load_trainable_neurons_of_multi_methods,
+    process_neurons_to_dict,
+    print_trainable_parameters,
+    print_calculated_trainable_parameters,
 )
 
 
@@ -106,9 +115,24 @@ class SFTTrainer(Trainer):
 
     _tag_names = ["trl", "sft"]
 
-    @deprecate_kwarg(
-        "tokenizer", "0.16.0", "processing_class", warn_if_greater_or_equal_version=True, raise_if_both_names=True
+    @_deprecate_arguments(
+        version="0.13.0",
+        deprecated_args=[
+            "dataset_text_field",
+            "packing",
+            "max_seq_length",
+            "dataset_num_proc",
+            "dataset_batch_size",
+            "neftune_noise_alpha",
+            "model_init_kwargs",
+            "dataset_kwargs",
+            "eval_packing",
+            "num_of_sequences",
+            "chars_per_token",
+        ],
+        custom_message="Deprecated positional argument(s) used in SFTTrainer, please use the SFTConfig to set these arguments instead.",
     )
+    @deprecate_kwarg("tokenizer", new_name="processing_class", version="0.16.0", raise_if_both_names=True)
     def __init__(
         self,
         model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
@@ -125,7 +149,23 @@ class SFTTrainer(Trainer):
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional["PeftConfig"] = None,
+        neuron_training_config: Optional[Dict] = None,
+        other_methods_training_config: Optional[Dict] = None,
+        dataset_text_field: Optional[str] = None,
+        packing: Optional[bool] = False,
         formatting_func: Optional[Callable] = None,
+        max_seq_length: Optional[int] = None,
+        infinite: Optional[bool] = None,
+        num_of_sequences: Optional[int] = None,
+        chars_per_token: Optional[float] = None,
+        dataset_num_proc: Optional[int] = None,
+        dataset_batch_size: Optional[int] = None,
+        dataset_train_batch_size: Optional[int] = None,
+        dataset_eval_batch_size: Optional[int] = None,
+        neftune_noise_alpha: Optional[float] = None,
+        model_init_kwargs: Optional[Dict] = None,
+        dataset_kwargs: Optional[Dict] = None,
+        eval_packing: Optional[bool] = None,
     ):
         if args is None:
             output_dir = "tmp_trainer"
@@ -137,6 +177,17 @@ class SFTTrainer(Trainer):
             args_as_dict.update({k: getattr(args, k) for k in args_as_dict.keys() if k.endswith("_token")})
             args = SFTConfig(**args_as_dict)
 
+        if neftune_noise_alpha is not None:
+            warnings.warn(
+                "You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.neftune_noise_alpha = neftune_noise_alpha
+
+        if model_init_kwargs is not None:
+            warnings.warn(
+                "You passed `model_init_kwargs` to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.model_init_kwargs = model_init_kwargs
         if getattr(args, "model_init_kwargs", None) is None:
             model_init_kwargs = {}
         elif not isinstance(model, str):
@@ -154,6 +205,11 @@ class SFTTrainer(Trainer):
                     )
                 model_init_kwargs["torch_dtype"] = torch_dtype
 
+        if infinite is not None:
+            warnings.warn(
+                "The `infinite` argument is deprecated and will be removed in a future version of TRL. Use `TrainingArguments.max_steps` or `TrainingArguments.num_train_epochs` instead to control training length."
+            )
+
         if isinstance(model, str):
             warnings.warn(
                 "You passed a model_id to the SFTTrainer. This will automatically create an "
@@ -164,9 +220,33 @@ class SFTTrainer(Trainer):
             else:
                 model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
 
+        if packing:
+            warnings.warn(
+                "You passed a `packing` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.packing = packing
+        if eval_packing is not None:
+            warnings.warn(
+                "You passed a `eval_packing` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.eval_packing = eval_packing
+
         if args.packing and data_collator is not None and isinstance(data_collator, DataCollatorForCompletionOnlyLM):
             raise ValueError(
                 "You passed a `DataCollatorForCompletionOnlyLM` to the SFTTrainer. This is not compatible with the `packing` argument."
+            )
+        
+        if peft_config is not None and neuron_training_config is not None:
+            raise ValueError(
+                "Cannot enable both peft and neuron training simultaneously. Please set only one."
+            )
+        if peft_config is not None and other_methods_training_config is not None:
+            raise ValueError(
+                "Cannot enable both peft and other training mathod simultaneously. Please set only one."
+            )
+        if neuron_training_config is not None and other_methods_training_config  is not None:
+            raise ValueError(
+                "Cannot enable both neuron training and other training mathod simultaneously. Please set only one."
             )
 
         if is_peft_available() and peft_config is not None:
@@ -235,11 +315,134 @@ class SFTTrainer(Trainer):
                     and not is_sharded_qlora
                 ):
                     peft_module_casting_to_bf16(model)
+                
+                print("-"*30, "SFT peft", "-"*30)
+                model.print_trainable_parameters()
+        elif neuron_training_config is not None or other_methods_training_config is not None:
+            if neuron_training_config is not None:
+                if not neuron_training_config.mix_neuron:
+                    neurons = load_trainable_neurons(model, neuron_training_config)
+                else:
+                    neurons = load_trainable_neurons_of_multi_methods(model, neuron_training_config)
+                neuron_training_config.trainable_neuron_num = len(neurons)
+            else:
+                if other_methods_training_config.get_intermediate_size_or_hidden_size == "intermediate":
+                    to_be_trained_neuron_num = other_methods_training_config.trainable_param_num / model.config.hidden_size
+                    print(f"The number of neurons that should be trained: trainable_param_num({other_methods_training_config.trainable_param_num}) / hidden_size({model.config.hidden_size}) = {to_be_trained_neuron_num}")
+                else: # "hidden"
+                    to_be_trained_neuron_num = other_methods_training_config.trainable_param_num / model.config.intermediate_size
+                    print(f"The number of neurons that should be trained: trainable_param_num({other_methods_training_config.trainable_param_num}) / hidden_size({model.config.intermediate_size}) = {to_be_trained_neuron_num}")
+                to_be_trained_neuron_num = math.ceil(to_be_trained_neuron_num)
+                neurons = []
+                if other_methods_training_config.training_method_name=="random_training":
+                    # for _ in range(to_be_trained_neuron_num):
+                    #     layer = random.randint(0, model.config.num_hidden_layers-1)
+                    #     pos = random.randint(0, model.config.intermediate_size-1)
+                    #     neurons.append([layer, pos])
+                    # 以上生成的有可能重复！故采用下面的方式生成
+                    # 生成笛卡尔积，即所有可能的 (layer, pos) 组合，
+                    # 其中layer在[0,model.config.num_hidden_layers-1]之间，layer在[0,model.config.intermediate_size-1]之间
+                    if other_methods_training_config.get_intermediate_size_or_hidden_size == "intermediate":
+                        all_pairs = list(product(range(0, model.config.num_hidden_layers), range(0, model.config.intermediate_size)))
+                    else:
+                        all_pairs = list(product(range(0, model.config.num_hidden_layers), range(0, model.config.hidden_size)))
+                    ns = random.sample(all_pairs, to_be_trained_neuron_num)
+                    neurons = [list(n) for n in ns]
+                elif other_methods_training_config.training_method_name=="random_last_layer_training":
+                    layer = model.config.num_hidden_layers-1
+                    # for _ in range(to_be_trained_neuron_num):
+                    #     pos = random.randint(0, model.config.intermediate_size-1)
+                    #     neurons.append([layer, pos])
+                    # 以上生成的有可能重复！故采用下面的方式生成
+                    if other_methods_training_config.get_intermediate_size_or_hidden_size == "intermediate":
+                        poses = random.sample(range(0, model.config.intermediate_size), to_be_trained_neuron_num)
+                    else:
+                        poses = random.sample(range(0, model.config.hidden_size), to_be_trained_neuron_num)
+                    neurons = [[layer, pos] for pos in poses]
+                print(f"To demonstrate, we now print the first 20 neurons:\n{neurons[:20]}")
+                print(f"To demonstrate, we now print the neurons to be trained:\n{neurons}")
+                other_methods_training_config.trainable_neuron_num = len(neurons)
+            
+            print(f'The actual number of trained neurons: {len(neurons)}')
+            target_layer_pos_dict = process_neurons_to_dict(neurons)
+            
+            # 冻结所有参数
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+
+            # 解冻目标位置的参数
+            for layer_idx in target_layer_pos_dict.keys():
+                # model.model.layers[layer].mlp.down_proj.weight.shape: (hidden_size, intermediate_size) 即torch.Size([3584, 18944])
+                ffn_weight = model.model.layers[layer_idx].mlp.down_proj.weight
+                ffn_weight.requires_grad = True
+                # requires_grad 是针对整个张量（如 model.fc2.weight）的属性，而不是特定元素或切片的属性。PyTorch 不支持针对张量中某些特定元素单独设置 requires_grad。 
+
+
+            # 定义 Hook 函数
+            def register_change_grad_hooks(model, target_layer_pos_dict):
+                """
+                注册 Hook，使得只更新 target_layer_pos_dict 中指定层和位置的参数，非目标位置梯度为 None。
+                """
+                def create_hook(mask_positions):
+                    def hook(grad):
+                        # print("Original Grad Shape:", grad.shape) # (hidden_size, intermediate_size) (2048, 16384) 
+                        # print("Original Grad:", grad)
+                        # print("Original Grad of neuron 1:", grad[:, 1])
+
+                        mask = torch.zeros_like(grad, dtype=torch.bool)
+                        for pos in mask_positions:
+                            if (
+                                    neuron_training_config
+                                    and getattr(neuron_training_config, "get_intermediate_size_or_hidden_size", None) == "intermediate"
+                                ) or (
+                                    other_methods_training_config
+                                    and getattr(other_methods_training_config, "get_intermediate_size_or_hidden_size", None) == "intermediate"
+                                ):
+                                mask[:, pos] = True
+                                # print("According to your settings, treat the `intermediate` dimension as neurons and only train the selected neurons")
+                            else: # "hidden"
+                                mask[pos, :] = True
+                                # print("According to your settings, treat the `hidden` dimension as neurons and only train the selected neurons")
+                        # 未选中的梯度位置设置为 None
+                        new_grad = grad.clone()
+
+                        new_grad[~mask] = 0
+                        # new_grad[~mask] = None
+
+                        # print("Modified Grad:", new_grad)
+                        # print("Modified Grad of neuron:", new_grad[:, 1])
+                        return new_grad
+                    return hook
+
+                # 遍历目标层，注册 Hook
+                for layer_idx, positions in target_layer_pos_dict.items():
+                    # model.model.layers[layer_idx].mlp.down_proj.weight [hidden_size, intermediate_size],gemma-2b是2048, 16384
+                    model.model.layers[layer_idx].mlp.down_proj.weight.register_hook(create_hook(positions))
+                    # # 定位到 FFN 层的权重
+                    # ffn_weight = model.model.layers[layer_idx].mlp.down_proj.weight
+                    # # 注册 Hook
+                    # ffn_weight.register_hook(create_hook(positions))
+
+            # 注册 Hook
+            register_change_grad_hooks(model, target_layer_pos_dict)
+            
+            print("-"*30, "SFT neuron training", "-"*30)
+            print_calculated_trainable_parameters(model)
+            if neuron_training_config is not None:
+                print_trainable_parameters(model, neuron_training_config)
+            if other_methods_training_config is not None:
+                print_trainable_parameters(model, other_methods_training_config)
 
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path)
             if getattr(processing_class, "pad_token", None) is None:
                 processing_class.pad_token = processing_class.eos_token
+
+        if max_seq_length is not None:
+            warnings.warn(
+                "You passed a `max_seq_length` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.max_seq_length = max_seq_length
 
         if args.max_seq_length is None:
             # to overcome some issues with broken tokenizers
@@ -249,9 +452,33 @@ class SFTTrainer(Trainer):
                 f"You didn't pass a `max_seq_length` argument to the SFTTrainer, this will default to {args.max_seq_length}"
             )
 
+        if dataset_num_proc is not None:
+            warnings.warn(
+                "You passed a `dataset_num_proc` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.dataset_num_proc = dataset_num_proc
         self.dataset_num_proc = args.dataset_num_proc
-        self.dataset_batch_size = args.dataset_batch_size
 
+        if dataset_train_batch_size is not None and dataset_eval_batch_size is not None:
+            warnings.warn(
+                "You passed a `dataset_train_batch_size` and a `dataset_eval_batch_size` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.dataset_train_batch_size = dataset_train_batch_size
+            args.dataset_eval_batch_size = dataset_eval_batch_size
+        self.dataset_train_batch_size = args.dataset_train_batch_size
+        self.dataset_eval_batch_size = args.dataset_eval_batch_size
+
+        if dataset_text_field is not None:
+            warnings.warn(
+                "You passed a `dataset_text_field` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.dataset_text_field = dataset_text_field
+
+        if dataset_kwargs is not None:
+            warnings.warn(
+                "You passed a `dataset_kwargs` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.dataset_kwargs = dataset_kwargs
         if args.dataset_kwargs is None:
             args.dataset_kwargs = {}
 
@@ -266,6 +493,18 @@ class SFTTrainer(Trainer):
         if not args.packing:
             if data_collator is None:
                 data_collator = DataCollatorForLanguageModeling(tokenizer=processing_class, mlm=False)
+
+        if num_of_sequences is not None:
+            warnings.warn(
+                "You passed a `num_of_sequences` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.num_of_sequences = num_of_sequences
+
+        if chars_per_token is not None:
+            warnings.warn(
+                "You passed a `chars_per_token` argument to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.chars_per_token = chars_per_token
 
         # Pre-process the datasets only once per node. The remaining processes will use the cache.
         with PartialState().local_main_process_first():
@@ -369,11 +608,7 @@ class SFTTrainer(Trainer):
                     "You passed a dataset that is already processed (contains an `input_ids` field) together with a valid formatting function. Therefore `formatting_func` will be ignored."
                 )
 
-            def formatting_func(x):
-                return x["input_ids"]
-
-            if not packing:
-                return dataset
+            return dataset
 
         # check if torch dataset / dataloader and do nothing
         # see https://github.com/huggingface/trl/pull/1468 for why datasets.IterableDataset needs a separate check
@@ -406,6 +641,7 @@ class SFTTrainer(Trainer):
                 add_special_tokens,
             )
 
+
     def _prepare_non_packed_dataloader(
         self,
         processing_class,
@@ -417,31 +653,26 @@ class SFTTrainer(Trainer):
         remove_unused_columns=True,
     ):
         # Inspired from: https://huggingface.co/learn/nlp-course/chapter7/6?fw=pt
-        def tokenize(element):
+        def process_func(element):
             outputs = processing_class(
-                element[dataset_text_field] if formatting_func is None else formatting_func(element),
+                element if formatting_func is None else formatting_func(element, processing_class),
                 add_special_tokens=add_special_tokens,
                 truncation=True,
-                padding=False,
+                padding="longest",
                 max_length=max_seq_length,
-                return_overflowing_tokens=False,
-                return_length=False,
+                # return_overflowing_tokens=False,
+                # return_length=False,
             )
-
-            if formatting_func is not None and not isinstance(formatting_func(element), list):
-                raise ValueError(
-                    "The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
-                )
-
-            return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
+            return {
+                "input_ids": outputs["input_ids"], 
+                "attention_mask": outputs["attention_mask"], 
+            }
 
         signature_columns = ["input_ids", "labels", "attention_mask"]
-
         if dataset.column_names is not None:  # None for IterableDataset
             extra_columns = list(set(dataset.column_names) - set(signature_columns))
         else:
             extra_columns = []
-
         if not remove_unused_columns and len(extra_columns) > 0:
             warnings.warn(
                 "You passed `remove_unused_columns=False` on a non-packed dataset. This might create some issues with the default collator and yield to errors. If you want to "
@@ -450,14 +681,22 @@ class SFTTrainer(Trainer):
 
         map_kwargs = {
             "batched": True,
+            "batch_size": self.dataset_train_batch_size,
             "remove_columns": dataset.column_names if remove_unused_columns else None,
-            "batch_size": self.dataset_batch_size,
         }
         if isinstance(dataset, datasets.Dataset):
             map_kwargs["num_proc"] = self.dataset_num_proc  # this arg is not available for IterableDataset
-        tokenized_dataset = dataset.map(tokenize, **map_kwargs)
-
+        tokenized_dataset = dataset.map(process_func, **map_kwargs)
+        
+        # train_dataloader = DataLoader(dataset=tokenized_dataset, 
+        #                           # batched=True,
+        #                           # batch_size=self.dataset_batch_size, 
+        #                           collate_fn=DataCollatorForCausalLM(tokenizer, padding="longest"), 
+        #                           shuffle=True
+        #                           )
+        
         return tokenized_dataset
+
 
     def _prepare_packed_dataloader(
         self,
@@ -503,7 +742,7 @@ class SFTTrainer(Trainer):
                 "Error occurred while packing the dataset. "
                 "Make sure that your dataset has enough samples to at least yield one packed sequence."
             ) from exc
-        return packed_dataset
+        return packed_dataset # 309行，204行
 
     def create_model_card(
         self,

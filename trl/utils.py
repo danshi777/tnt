@@ -38,7 +38,7 @@ class ScriptArguments:
 
     dataset_name: str
     dataset_train_split: str = "train"
-    dataset_test_split: str = "test"
+    dataset_test_split: str = "validation"
     config: Optional[str] = None
     gradient_checkpointing_use_reentrant: bool = False
     ignore_bias_buffers: bool = False

@@ -28,11 +28,10 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
-import transformers
 from accelerate import PartialState
 from accelerate.utils import is_deepspeed_available, tqdm
 from datasets import Dataset
-from packaging import version
+from huggingface_hub.utils._deprecation import _deprecate_arguments
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
@@ -64,6 +63,9 @@ from .utils import (
     pad,
     pad_to_length,
     peft_module_casting_to_bf16,
+    get_trainable_parameters,
+    print_trainable_parameters,
+    print_calculated_trainable_parameters,
 )
 
 
@@ -173,9 +175,6 @@ class DPOTrainer(Trainer):
             This supercedes the `tokenizer` argument, which is now deprecated.
         model_init (`Callable[[], transformers.PreTrainedModel]`):
             The model initializer to use for training. If None is specified, the default model initializer will be used.
-        compute_metrics (`Callable[[EvalPrediction], Dict]`, *optional*):
-            The function to use to compute the metrics. Must take a `EvalPrediction` and return
-            a dictionary string to metric values.
         callbacks (`List[transformers.TrainerCallback]`):
             The callbacks to use for training.
         optimizers (`Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`):
@@ -184,36 +183,90 @@ class DPOTrainer(Trainer):
             The function to use to preprocess the logits before computing the metrics.
         peft_config (`Dict`, defaults to `None`):
             The PEFT configuration to use for training. If you pass a PEFT configuration, the model will be wrapped in a PEFT model.
+        compute_metrics (`Callable[[EvalPrediction], Dict]`, *optional*):
+            The function to use to compute the metrics. Must take a `EvalPrediction` and return
+            a dictionary string to metric values.
     """
 
     _tag_names = ["trl", "dpo"]
 
-    @deprecate_kwarg(
-        "tokenizer", "0.16.0", "processing_class", warn_if_greater_or_equal_version=True, raise_if_both_names=True
+    @_deprecate_arguments(
+        version="0.13.0",
+        deprecated_args=[
+            "beta",
+            "label_smoothing",
+            "loss_type",
+            "label_pad_token_id",
+            "padding_value",
+            "truncation_mode",
+            "max_length",
+            "max_prompt_length",
+            "max_target_length",
+            "is_encoder_decoder",
+            "disable_dropout",
+            "generate_during_eval",
+            "precompute_ref_log_probs",
+            "dataset_num_proc",
+            "model_init_kwargs",
+            "ref_model_init_kwargs",
+            "model_adapter_name",
+            "ref_adapter_name",
+            "reference_free",
+            "force_use_ref_model",
+        ],
+        custom_message="Deprecated positional argument(s) used in DPOTrainer, please use the DPOConfig to set these arguments instead.",
     )
+    @deprecate_kwarg("tokenizer", new_name="processing_class", version="0.16.0", raise_if_both_names=True)
     def __init__(
         self,
         model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
         ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
+        beta: float = 0.1,
+        label_smoothing: float = 0,
+        loss_type: Optional[str] = None,
         args: Optional[DPOConfig] = None,
         data_collator: Optional[DataCollator] = None,
+        label_pad_token_id: int = -100,
+        padding_value: Optional[int] = None,
+        truncation_mode: str = "keep_end",
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         processing_class: Optional[
             Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
         ] = None,
         model_init: Optional[Callable[[], PreTrainedModel]] = None,
-        compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+        max_length: Optional[int] = None,
+        max_prompt_length: Optional[int] = None,
+        max_target_length: Optional[int] = None,
         peft_config: Optional[Dict] = None,
+        neuron_training_config: Optional[Dict] = None,
+        is_encoder_decoder: Optional[bool] = None,
+        disable_dropout: bool = True,
+        generate_during_eval: bool = False,
+        compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
+        precompute_ref_log_probs: bool = False,
+        dataset_num_proc: Optional[int] = None,
+        model_init_kwargs: Optional[Dict] = None,
+        ref_model_init_kwargs: Optional[Dict] = None,
+        model_adapter_name: Optional[str] = None,
+        ref_adapter_name: Optional[str] = None,
+        reference_free: bool = False,
+        force_use_ref_model: bool = False,
     ):
         if not isinstance(model, str) and ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you must mass a copy of it, or `None` if you use peft."
             )
+
+        if model_init_kwargs is not None:
+            warnings.warn(
+                "You passed `model_init_kwargs` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.model_init_kwargs = model_init_kwargs
 
         if args.model_init_kwargs is None:
             model_init_kwargs = {}
@@ -233,6 +286,12 @@ class DPOTrainer(Trainer):
                         f"Invalid `torch_dtype` passed to the DPOConfig. Expected a string with either `torch.dtype` or 'auto', but got {torch_dtype}."
                     )
                 model_init_kwargs["torch_dtype"] = torch_dtype
+
+        if ref_model_init_kwargs is not None:
+            warnings.warn(
+                "You passed `ref_model_init_kwargs` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.ref_model_init_kwargs = ref_model_init_kwargs
 
         if args.ref_model_init_kwargs is None:
             ref_model_init_kwargs = {}
@@ -271,6 +330,12 @@ class DPOTrainer(Trainer):
         # has been called in order to properly call autocast if needed.
         self._peft_has_been_casted_to_bf16 = False
 
+        if force_use_ref_model:
+            warnings.warn(
+                "You passed `force_use_ref_model` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.force_use_ref_model = force_use_ref_model
+
         if not is_peft_available() and peft_config is not None:
             raise ValueError(
                 "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
@@ -285,7 +350,7 @@ class DPOTrainer(Trainer):
                     "You passed both a ref_model and a peft_config. For training PEFT adapters with DPO there is no need to pass a reference"
                     " model. Please pass `ref_model=None` in case you want to train PEFT adapters, or pass a ref_model with `force_use_ref_model=True` in DPOTrainer's init."
                     " if you want to use a different ref_model."
-                )
+                ) # 使用 DPO 训练 PEFT adapters 时无需传递 reference model
 
             if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
                 _support_gc_kwargs = hasattr(
@@ -313,6 +378,8 @@ class DPOTrainer(Trainer):
 
             # get peft model with the given config
             model = get_peft_model(model, peft_config)
+            print("-"*30, "DPO peft", "-"*30)
+            model.print_trainable_parameters()
             if args.bf16 and getattr(model, "is_loaded_in_4bit", False):
                 peft_module_casting_to_bf16(model)
                 # If args.bf16 we need to explicitly call `generate` with torch amp autocast context manager
@@ -332,12 +399,22 @@ class DPOTrainer(Trainer):
 
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+        if generate_during_eval:
+            warnings.warn(
+                "You passed `generate_during_eval` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.generate_during_eval = generate_during_eval
         if args.generate_during_eval and not is_wandb_available():
             raise ValueError(
                 "`generate_during_eval=True` requires Weights and Biases to be installed."
                 " Please install `wandb` to resolve."
             )
 
+        if is_encoder_decoder is not None:
+            warnings.warn(
+                "You passed `is_encoder_decoder` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.is_encoder_decoder = is_encoder_decoder
         if model is not None:
             self.is_encoder_decoder = model.config.is_encoder_decoder
         elif args.is_encoder_decoder is None:
@@ -356,20 +433,131 @@ class DPOTrainer(Trainer):
             self.is_vision_model = False
 
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
+
+        if peft_config is not None and neuron_training_config is not None:
+            raise ValueError(
+                "Cannot enable both peft and neuron training simultaneously. Please set only one."
+            )
+
+        if model_adapter_name is not None:
+            warnings.warn(
+                "You passed `model_adapter_name` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.model_adapter_name = model_adapter_name
         self.model_adapter_name = args.model_adapter_name
+
+        if ref_adapter_name is not None:
+            warnings.warn(
+                "You passed `ref_adapter_name` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.ref_adapter_name = ref_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
+
+        if reference_free:
+            warnings.warn(
+                "You passed `reference_free` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.reference_free = reference_free
         self.reference_free = args.reference_free
+
+        if precompute_ref_log_probs:
+            warnings.warn(
+                "You passed `precompute_ref_log_probs` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.precompute_ref_log_probs = precompute_ref_log_probs
 
         if ref_model:
             self.ref_model = ref_model
         elif self.is_peft_model or args.precompute_ref_log_probs:
             # The `model` with adapters turned off will be used as the reference model
             self.ref_model = None
+        elif neuron_training_config is not None:
+            model, target_layer_pos_dict = get_trainable_parameters(model, neuron_training_config)
+            # 冻结所有参数
+            for param in model.parameters():
+                param.requires_grad = False
+            # 解冻目标位置的参数
+            for layer_idx in target_layer_pos_dict.keys():
+                ffn_weight = model.model.layers[layer_idx].mlp.down_proj.weight
+                ffn_weight.requires_grad = True
+
+            # 定义 Hook 函数
+            def register_change_grad_hooks(model, target_layer_pos_dict):
+                """
+                注册 Hook，使得只更新 target_layer_pos_dict 中指定层和位置的参数，非目标位置梯度为 None。
+                """
+                def create_hook(mask_positions):
+                    def hook(grad):
+                        # print("Original Grad Shape:", grad.shape)
+                        # print("Original Grad:", grad)
+                        # print("Original Grad of neuron 1:", grad[:, 1])
+
+                        mask = torch.zeros_like(grad, dtype=torch.bool)
+                        for pos in mask_positions:
+                            mask[:, pos] = True
+                        # 未选中的梯度位置设置为 None
+                        new_grad = grad.clone()
+
+                        new_grad[~mask] = 0
+                        # new_grad[~mask] = None
+
+                        # print("Modified Grad:", new_grad)
+                        # print("Modified Grad of neuron:", new_grad[:, 1])
+                        return new_grad
+                    return hook
+
+                # 遍历目标层，注册 Hook
+                for layer_idx, positions in target_layer_pos_dict.items():
+                    # model.model.layers[layer_idx].mlp.down_proj.weight [hidden_size, intermediate_size],gemma-2b是2048, 16384
+                    model.model.layers[layer_idx].mlp.down_proj.weight.register_hook(create_hook(positions))
+                    # # 定位到 FFN 层的权重
+                    # ffn_weight = model.model.layers[layer_idx].mlp.down_proj.weight
+                    # # 注册 Hook
+                    # ffn_weight.register_hook(create_hook(positions))
+
+            # 注册 Hook
+            register_change_grad_hooks(model, target_layer_pos_dict)
+            
+            print("-"*30, "DPO neuron training", "-"*30)
+            print_calculated_trainable_parameters(model)
+            print_trainable_parameters(model, neuron_training_config)
+
+            self.ref_model = create_reference_model(model)
         else:
             self.ref_model = create_reference_model(model)
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
+
+        if max_length is not None:
+            warnings.warn(
+                "You passed `max_length` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.max_length = max_length
+
+        if max_prompt_length is not None:
+            warnings.warn(
+                "You passed `max_prompt_length` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.max_prompt_length = max_prompt_length
+
+        if max_target_length is not None:
+            warnings.warn(
+                "You passed `max_target_length` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.max_completion_length = max_target_length
+
+        if label_pad_token_id != -100:
+            warnings.warn(
+                "You passed `label_pad_token_id` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.label_pad_token_id = label_pad_token_id
+
+        if padding_value is not None:
+            warnings.warn(
+                "You passed `padding_value` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.padding_value = padding_value
 
         if args.padding_value is not None:
             self.padding_value = args.padding_value
@@ -388,6 +576,11 @@ class DPOTrainer(Trainer):
         if data_collator is None:
             data_collator = PreferenceCollator(pad_token_id=self.padding_value)
 
+        if not disable_dropout:
+            warnings.warn(
+                "You passed `disable_dropout` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.disable_dropout = disable_dropout
         if args.disable_dropout:
             disable_dropout_in_model(model)
             if self.ref_model is not None:
@@ -397,16 +590,30 @@ class DPOTrainer(Trainer):
         self.generate_during_eval = args.generate_during_eval
         self.label_pad_token_id = args.label_pad_token_id
         self.max_prompt_length = args.max_prompt_length
+        if truncation_mode != "keep_end":
+            warnings.warn(
+                "You passed `truncation_mode` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.truncation_mode = truncation_mode
         self.truncation_mode = args.truncation_mode
         self.max_completion_length = args.max_completion_length
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
-        self.use_num_logits_to_keep = args.use_num_logits_to_keep
 
         # Since ref_logs are precomputed on the first call to get_train/eval_dataloader
         # keep track of first called to avoid computation of future calls
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
 
+        if loss_type is not None:
+            warnings.warn(
+                "You passed `loss_type` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.loss_type = loss_type
+        if label_smoothing != 0:
+            warnings.warn(
+                "You passed `label_smoothing` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.label_smoothing = label_smoothing
         if (
             args.loss_type in ["hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down"]
             and args.label_smoothing > 0
@@ -417,6 +624,11 @@ class DPOTrainer(Trainer):
         if args.loss_type == "kto_pair":
             raise ValueError("Support for kto_pair has been removed in DPOTrainer. Please use KTOTrainer.")
 
+        if beta != 0.1:
+            warnings.warn(
+                "You passed `beta` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.beta = beta
         self.beta = args.beta
         self.label_smoothing = args.label_smoothing
         self.loss_type = args.loss_type
@@ -430,18 +642,16 @@ class DPOTrainer(Trainer):
             )
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
+
         self.f_divergence_type = args.f_divergence_type
         self.f_divergence_params = {FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY: args.f_alpha_divergence_coef}
-        self.dataset_num_proc = args.dataset_num_proc
 
-        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in DPO, the sampled data does not include the
-        # "input_ids" key. Instead, the available keys are "prompt_input_ids", "chosen_input_ids", and
-        # "rejected_input_ids". As a result, the trainer issues the warning: "Could not estimate the number of tokens
-        # of the input, floating-point operations will not be computed." To suppress this warning, we set the
-        # "estimate_tokens" key in the model's "warnings_issued" dictionary to True. This acts as a flag to indicate
-        # that the warning has already been issued.
-        model.warnings_issued["estimate_tokens"] = True
+        if dataset_num_proc is not None:
+            warnings.warn(
+                "You passed `dataset_num_proc` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
+            )
+            args.dataset_num_proc = dataset_num_proc
+        self.dataset_num_proc = args.dataset_num_proc
 
         # Compute that only on the main process for faster data processing.
         # see: https://github.com/huggingface/trl/pull/1255
@@ -537,13 +747,12 @@ class DPOTrainer(Trainer):
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
         if args.sync_ref_model:
-            if self.precompute_ref_log_probs:
+            if precompute_ref_log_probs:
                 raise ValueError(
                     "You cannot use `precompute_ref_log_probs=True` with TR-DPO method. Please set `precompute_ref_log_probs=False`."
                 )
 
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
-
         if self.loss_type == "bco_pair":
             self.running = RunningMoments(self.accelerator)
 
@@ -587,9 +796,9 @@ class DPOTrainer(Trainer):
 
         # Add special tokens (typically for encoder-decoder models)
         if add_special_tokens:
-            if tokenizer.bos_token_id is not None:
+            if tokenizer.bos_token is not None:
                 prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
-            if tokenizer.eos_token_id is not None:
+            if tokenizer.eos_token is not None:
                 prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
         chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
         rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
@@ -622,9 +831,9 @@ class DPOTrainer(Trainer):
 
         # Add special tokens (typically for encoder-decoder models)
         if add_special_tokens:
-            if tokenizer.bos_token_id is not None:
+            if tokenizer.bos_token is not None:
                 prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
-            if tokenizer.eos_token_id is not None:
+            if tokenizer.eos_token is not None:
                 prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
         chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
         rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
@@ -1035,24 +1244,10 @@ class DPOTrainer(Trainer):
             losses_rejected = 1 - F.sigmoid(self.beta * (chosen_logratios - rejected_logratios))
             losses = losses_chosen + losses_rejected
 
-        elif self.loss_type == "discopop":
-            # Eqn (5) of the DiscoPOP paper (https://huggingface.co/papers/2406.08414)
-            # This loss was discovered with LLM discovery
-            logratios = chosen_logps - rejected_logps
-            ref_logratios = ref_chosen_logps - ref_rejected_logps
-            logits = logratios - ref_logratios
-            logits = logits * self.beta
-            # Modulate the mixing coefficient based on the log ratio magnitudes
-            log_ratio_modulation = torch.sigmoid(logits / self.args.discopop_tau)
-            logistic_component = -F.logsigmoid(logits)
-            exp_component = torch.exp(-logits)
-            # Blend between logistic and exponential component based on log ratio modulation
-            losses = logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
-
         else:
             raise ValueError(
                 f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'exo_pair', "
-                "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'discopop', 'apo_zero', 'apo_down']"
+                "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'apo_zero', 'apo_down']"
             )
 
         chosen_rewards = self.beta * (chosen_logps.to(device) - ref_chosen_logps.to(device)).detach()
@@ -1115,10 +1310,10 @@ class DPOTrainer(Trainer):
 
             # Get the first column idx that is all zeros and remove every column after that
             empty_cols = torch.sum(attention_mask, dim=0) == 0
-            first_empty_col = torch.nonzero(empty_cols)[0].item() if empty_cols.any() else attention_mask.size(1)
-            input_ids = input_ids[:, :first_empty_col]
-            attention_mask = attention_mask[:, :first_empty_col]
-            loss_mask = loss_mask[:, :first_empty_col]
+            first_empty_col = torch.nonzero(empty_cols)[0].item() if empty_cols.any() else attention_mask.size(1) + 1
+            input_ids = input_ids[:, : first_empty_col - 1]
+            attention_mask = attention_mask[:, : first_empty_col - 1]
+            loss_mask = loss_mask[:, : first_empty_col - 1]
 
             # Truncate right
             if self.args.max_length is not None:
@@ -1126,31 +1321,12 @@ class DPOTrainer(Trainer):
                 attention_mask = attention_mask[:, : self.args.max_length]
                 loss_mask = loss_mask[:, : self.args.max_length]
 
-            if self.use_num_logits_to_keep:
-                # Compute num_logits_to_keep based on loss_mask pattern:
-                # [[0, 0, 0, x, x, x, x],
-                #  [0, 0, 0, x, x, x, 0]]
-                #         ^ start computing logits from here ([:, -(7-3+1):])
-                first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
-                num_logits_to_keep = loss_mask.shape[1] - first_compute_index
-                model_kwargs["num_logits_to_keep"] = num_logits_to_keep.item() + 1  # +1 for the first label
-
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
 
             # Offset the logits by one to align with the labels
             logits = outputs.logits[:, :-1, :]
             labels = input_ids[:, 1:].clone()
             loss_mask = loss_mask[:, 1:].bool()
-
-            if self.use_num_logits_to_keep:
-                # Align labels with logits
-                # logits:    -,  -, [x2, x3, x4, x5, x6]
-                #                     ^ --------- ^       after logits[:, :-1, :]
-                # labels:   [y0, y1, y2, y3, y4, y5, y6]
-                #                         ^ --------- ^   with num_logits_to_keep=4, [:, -4:]
-                # loss_mask: [0,  0,  0,  1,  1,  1,  1]
-                labels = labels[:, -num_logits_to_keep:]
-                loss_mask = loss_mask[:, -num_logits_to_keep:]
 
         if logits.shape[:2] != labels.shape[:2]:
             # for llava, the returned logits include the image tokens (placed before the text tokens)
@@ -1403,15 +1579,13 @@ class DPOTrainer(Trainer):
 
         return initial_output
 
-    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+    def log(self, logs: Dict[str, float]) -> None:
         """
         Log `logs` on the various objects watching training, including stored metrics.
 
         Args:
             logs (`Dict[str, float]`):
                 The values to log.
-            start_time (`float` or `None`, *optional*, defaults to `None`):
-                Start time of the training.
         """
         # logs either has 'loss' or 'eval_loss'
         train_eval = "train" if "loss" in logs else "eval"
@@ -1419,11 +1593,7 @@ class DPOTrainer(Trainer):
         for key, metrics in self._stored_metrics[train_eval].items():
             logs[key] = torch.tensor(metrics).mean().item()
         del self._stored_metrics[train_eval]
-
-        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
-            return super().log(logs, start_time)
-        else:  # transformers<=4.46
-            return super().log(logs)
+        return super().log(logs)
 
     def create_model_card(
         self,

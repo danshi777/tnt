@@ -24,6 +24,7 @@ from ..trainer.utils import ConstantLengthDataset
 FORMAT_MAPPING = {
     "chatml": [{"content": Value(dtype="string", id=None), "role": Value(dtype="string", id=None)}],
     "instruction": {"completion": Value(dtype="string", id=None), "prompt": Value(dtype="string", id=None)},
+    "question_answer": {"question": Value(dtype="string", id=None), "answer": Value(dtype="string", id=None)},
 }
 
 
@@ -43,6 +44,24 @@ def conversations_formatting_function(tokenizer: AutoTokenizer, messages_field: 
             return tokenizer.apply_chat_template(examples[messages_field], tokenize=False)
 
     return format_dataset
+
+def question_answer_formatting_function(tokenizer: AutoTokenizer):
+    r"""
+    return a callable function that takes in an "instructions" dataset and returns a formatted dataset, based on the tokenizer
+    apply chat template to the dataset
+    """
+    def prepare_sample_text(examples):
+        if isinstance(examples["question"], list):
+            output_texts = []
+            for i in range(len(examples["question"])):
+                text = f"Question: {examples['question'][i]}\n\nAnswer: {examples['answer'][i]}"
+                output_texts.append(text)
+            return output_texts
+        else:
+            text = f"Question: {examples['question']}\n\nAnswer: {examples['answer']}"
+            return text
+    
+    return prepare_sample_text
 
 
 def instructions_formatting_function(tokenizer: AutoTokenizer):
@@ -98,5 +117,8 @@ def get_formatting_func_from_dataset(
         elif dataset.features == FORMAT_MAPPING["instruction"]:
             logging.info("Formatting dataset with instruction format")
             return instructions_formatting_function(tokenizer)
-
+        elif dataset.features == FORMAT_MAPPING["question_answer"]:
+            logging.info("Formatting dataset with question & answer format")
+            return question_answer_formatting_function(tokenizer)
+            
     return None

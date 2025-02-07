@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import os
+import math
 import importlib.resources as pkg_resources
 import json
 import random
 import warnings
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-import datasets
 import numpy as np
 import pandas as pd
 import torch
@@ -51,6 +52,7 @@ from transformers.utils import (
 from ..import_utils import is_unsloth_available
 from ..trainer.model_config import ModelConfig
 
+from types import SimpleNamespace
 
 if is_peft_available():
     from peft import LoraConfig, PeftConfig
@@ -628,14 +630,6 @@ class ConstantLengthDataset(IterableDataset):
                     "The passed formatting_func has more than one argument. Usually that function should have a single argument `example`"
                     " which corresponds to the dictionary returned by each element of the dataset. Make sure you know what you are doing."
                 )
-        self.pretokenized = False
-        column_names = (
-            dataset.column_names if isinstance(dataset, (datasets.Dataset, datasets.IterableDataset)) else None
-        )
-        if column_names is not None and "input_ids" in column_names:
-            self.pretokenized = True
-            # since the dataset is tokenized, the unit of buffer size should be tokens
-            self.max_buffer_size = seq_length * num_of_sequences
 
     def __len__(self):
         return len(self.dataset)
@@ -649,6 +643,9 @@ class ConstantLengthDataset(IterableDataset):
                 if buffer_len >= self.max_buffer_size:
                     break
                 try:
+                    # next_item = next(iterator)
+                    # formatted = self.formatting_func(next_item)
+                    # print(next_item["id"], "Formatted item:", formatted)
                     buffer.append(self.formatting_func(next(iterator)))
                     buffer_len += len(buffer[-1])
                 except StopIteration:
@@ -660,16 +657,13 @@ class ConstantLengthDataset(IterableDataset):
                         break
             if self.shuffle:
                 random.shuffle(buffer)
-            if self.pretokenized:
-                tokenized_inputs = buffer
-            else:
-                tokenized_inputs = self.tokenizer(
-                    buffer, add_special_tokens=self.add_special_tokens, truncation=False
-                )["input_ids"]
+            tokenized_inputs = self.tokenizer(buffer, add_special_tokens=self.add_special_tokens, truncation=False)[
+                "input_ids"
+            ]
             all_token_ids = []
-            for tokenized_input in tokenized_inputs:
+            for tokenized_input in tokenized_inputs: # 2700条
                 if self.append_concat_token:
-                    tokenized_input = tokenized_input + [self.concat_token_id]
+                    tokenized_input = tokenized_input + [self.concat_token_id] # self.concat_token_id: Defaults to tokenizer.eos_token_id
                 all_token_ids.extend(tokenized_input)
             examples = []
             for i in range(0, len(all_token_ids), self.seq_length):
@@ -918,17 +912,67 @@ def get_peft_config(model_config: ModelConfig) -> "Optional[PeftConfig]":
         )
 
     peft_config = LoraConfig(
-        task_type=model_config.lora_task_type,
         r=model_config.lora_r,
-        target_modules=model_config.lora_target_modules,
         lora_alpha=model_config.lora_alpha,
         lora_dropout=model_config.lora_dropout,
+        target_modules=["q_proj", "v_proj"],
         bias="none",
-        use_rslora=model_config.use_rslora,
-        modules_to_save=model_config.lora_modules_to_save,
+        task_type="CAUSAL_LM",
+        # use_rslora=model_config.use_rslora,
+        # modules_to_save=model_config.lora_modules_to_save,
     )
 
     return peft_config
+
+
+def get_neuron_training_config(model_config: ModelConfig) -> "Optional[PeftConfig]":
+    if model_config.use_neuron_training is False:
+        return None
+    neuron_training_config = SimpleNamespace(
+        trainable_param_num=model_config.trainable_param_num,
+        neuron_file=model_config.neuron_file,
+        model_name=model_config.model_name,
+        adversarial_method_name=model_config.adversarial_method_name,
+        get_intermediate_size_or_hidden_size=model_config.get_intermediate_size_or_hidden_size,
+        mix_neuron=model_config.mix_neuron,
+    )
+    return neuron_training_config
+
+
+def get_other_methods_training_config(model_config: ModelConfig) -> "Optional[PeftConfig]":
+    if sum([model_config.use_random_training, model_config.use_random_last_layer_training]) == 1:
+        if model_config.use_random_training==True:
+            other_methods_training_config = SimpleNamespace(
+                training_method_name="random_training",
+                trainable_param_num=model_config.trainable_param_num,
+                model_name=model_config.model_name,
+                adversarial_method_name=model_config.adversarial_method_name,
+                get_intermediate_size_or_hidden_size=model_config.get_intermediate_size_or_hidden_size,
+            )
+        elif model_config.use_random_last_layer_training==True:
+            other_methods_training_config = SimpleNamespace(
+                training_method_name="random_last_layer_training",
+                trainable_param_num=model_config.trainable_param_num,
+                model_name=model_config.model_name,
+                adversarial_method_name=model_config.adversarial_method_name,
+                get_intermediate_size_or_hidden_size=model_config.get_intermediate_size_or_hidden_size,
+            )
+        return other_methods_training_config
+    elif sum([model_config.use_random_training, model_config.use_random_last_layer_training]) < 1:
+        return None
+    else:
+        raise ValueError("Only one `other training method` can be set at a time, but you have set more than one training method to `True`.")
+
+
+# def get_random_last_layer_training_config(model_config: ModelConfig) -> "Optional[PeftConfig]":
+#     if model_config.use_random_last_layer_training is False:
+#         return None
+#     random_last_layer_training_config = SimpleNamespace(
+#         trainable_param_num=model_config.trainable_param_num,
+#         model_name=model_config.model_name,
+#         adversarial_method_name=model_config.adversarial_method_name,
+#     )
+#     return random_last_layer_training_config
 
 
 def get_exp_cap(value, decimal=4):
@@ -1476,3 +1520,172 @@ def generate_model_card(
         tokenizers_version=version("tokenizers"),
     )
     return card
+
+###############################################################
+
+def pos_list2str(pos_list):
+    return '@'.join([str(pos) for pos in pos_list])
+
+
+def pos_str2list(pos_str):
+    return [int(pos) for pos in pos_str.split('@')]
+
+
+# def get_trainable_parameters(model, config):
+#     neurons = load_trainable_neurons(config, model.config)
+#     neurons_per_layer = process_neurons_to_dict(neurons)
+    
+#     # 冻结所有参数
+#     for name, param in model.named_parameters():
+#         param.requires_grad = False
+#     # 解冻特定参数
+#     for layer in neurons_per_layer.keys():
+#         with torch.no_grad():
+#             # model.model.layers[layer].mlp.down_proj.weight.shape: (hidden_size, intermediate_size) 即torch.Size([3584, 18944])
+#             model.model.layers[layer].mlp.down_proj.weight.requires_grad = True
+#     # requires_grad 是针对整个张量（如 model.fc2.weight）的属性，而不是特定元素或切片的属性。PyTorch 不支持针对张量中某些特定元素单独设置 requires_grad。 
+
+#     return model, neurons_per_layer
+
+def load_trainable_neurons(model, config):
+    model_config = model.config
+    # neuron_file = os.path.join(config.neuron_dir, f'{config.adversarial_method_name}_{config.model_name}.json')
+    neuron_file = config.neuron_file
+    print(f"Load neurons from: {neuron_file}")
+    with open(neuron_file, 'r') as f:
+        neuron_bag_list = json.load(f)
+
+    if config.get_intermediate_size_or_hidden_size == "intermediate":
+        to_be_trained_neuron_num = config.trainable_param_num / model_config.hidden_size
+        print(f"The number of neurons that should be trained: trainable_param_num({config.trainable_param_num}) / hidden_size({model_config.hidden_size}) = {to_be_trained_neuron_num}")
+    else: # "hidden"
+        to_be_trained_neuron_num = config.trainable_param_num / model_config.intermediate_size
+        print(f"The number of neurons that should be trained: trainable_param_num({config.trainable_param_num}) / hidden_size({model_config.intermediate_size}) = {to_be_trained_neuron_num}")
+    to_be_trained_neuron_num = math.ceil(to_be_trained_neuron_num)
+    neurons = []
+    neuron_counter = Counter()
+    # neuron_bag_list: 所有example所产生的neurons 
+    # neuron_bag: 某example所产生的neurons，如[[11, 2891, 0.0002630653325468302], [10, 1845, 0.0002512137289159], [10, 1154, 0.00021400029072538018], ...]
+    for neuron_bag in neuron_bag_list:
+        for neuron in neuron_bag:
+            neuron_counter.update([pos_list2str(neuron[:2])])
+    most_common_neuron = neuron_counter.most_common(to_be_trained_neuron_num)
+    print(f"To demonstrate, we now print the first 20 neurons:\n{most_common_neuron[:20]}")
+    print(f"To demonstrate, we now print the neurons to be trained:\n{most_common_neuron}")
+    neurons = [pos_str2list(ne_str[0]) for ne_str in most_common_neuron]
+    return neurons
+
+
+def load_trainable_neurons_of_multi_methods(model, config):
+    model_config = model.config
+    # neuron_file = os.path.join(config.neuron_dir, f'{config.adversarial_method_name}_{config.model_name}.json')
+    neuron_file = config.neuron_file
+    neuron_bag_list = []
+    for neuron_file in ["results/neurons/DAP_gemma-2b-it_cross_entropy_intermediate_top50_neuron.json",
+                        "results/neurons/DeepInception_gemma-2b-it_cross_entropy_intermediate_top50_neuron.json",
+                        "results/neurons/MultiJail_gemma-2b-it_cross_entropy_intermediate_top50_neuron.json"]:
+        print(f"Load neurons from: {neuron_file}")
+        with open(neuron_file, 'r') as f:
+            neuron_bag_list.extend(json.load(f))
+
+    if config.get_intermediate_size_or_hidden_size == "intermediate":
+        to_be_trained_neuron_num = config.trainable_param_num / model_config.hidden_size
+        print(f"The number of neurons that should be trained: trainable_param_num({config.trainable_param_num}) / hidden_size({model_config.hidden_size}) = {to_be_trained_neuron_num}")
+    else: # "hidden"
+        to_be_trained_neuron_num = config.trainable_param_num / model_config.intermediate_size
+        print(f"The number of neurons that should be trained: trainable_param_num({config.trainable_param_num}) / hidden_size({model_config.intermediate_size}) = {to_be_trained_neuron_num}")
+    to_be_trained_neuron_num = math.ceil(to_be_trained_neuron_num)
+    neurons = []
+    neuron_counter = Counter()
+    # neuron_bag_list: 所有example所产生的neurons 
+    # neuron_bag: 某example所产生的neurons，如[[11, 2891, 0.0002630653325468302], [10, 1845, 0.0002512137289159], [10, 1154, 0.00021400029072538018], ...]
+    for neuron_bag in neuron_bag_list:
+        for neuron in neuron_bag:
+            neuron_counter.update([pos_list2str(neuron[:2])])
+    most_common_neuron = neuron_counter.most_common(to_be_trained_neuron_num)
+    print(f"To demonstrate, we now print the first 20 neurons:\n{most_common_neuron[:20]}")
+    print(f"To demonstrate, we now print the neurons to be trained:\n{most_common_neuron}")
+    neurons = [pos_str2list(ne_str[0]) for ne_str in most_common_neuron]
+    return neurons
+
+
+def process_neurons_to_dict(neurons):
+    neuron_dict = {}
+    for layer, pos in neurons:
+        if layer not in neuron_dict.keys():
+            neuron_dict[layer] = []
+            neuron_dict[layer].append(pos)
+        else:
+            neuron_dict[layer].append(pos)
+    return neuron_dict
+
+
+# def print_trainable_parameters(model):
+#     """
+#     Prints the number of trainable parameters in the model.
+#     """
+#     trainable_params = 0
+#     all_param = 0
+#     for _, param in model.named_parameters():
+#         all_param += param.numel()
+#         if param.requires_grad:
+#             trainable_params += param.numel()
+#     print(
+#         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+#     )
+def print_calculated_trainable_parameters(model):
+    r"""
+    Returns the number of trainable parameters and number of all parameters in the model.
+    """
+    # note: same as PeftModel.get_nb_trainable_parameters
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        num_params = param.numel()
+        # if using DS Zero 3 and the weights are initialized empty
+        if num_params == 0 and hasattr(param, "ds_numel"):
+            num_params = param.ds_numel
+
+        # Due to the design of 4bit linear layers from bitsandbytes
+        # one needs to multiply the number of parameters by 2 to get
+        # the correct number of parameters
+        if param.__class__.__name__ == "Params4bit":
+            num_params = num_params * 2
+
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+
+    print(
+        f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}"
+    )
+
+def print_trainable_parameters(model, config):
+    r"""
+    Returns the number of trainable parameters and number of all parameters in the model.
+    """
+    # note: same as PeftModel.get_nb_trainable_parameters
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        num_params = param.numel()
+        # if using DS Zero 3 and the weights are initialized empty
+        if num_params == 0 and hasattr(param, "ds_numel"):
+            num_params = param.ds_numel
+
+        # Due to the design of 4bit linear layers from bitsandbytes
+        # one needs to multiply the number of parameters by 2 to get
+        # the correct number of parameters
+        if param.__class__.__name__ == "Params4bit":
+            num_params = num_params * 2
+
+        all_param += num_params
+        # if param.requires_grad:
+        #     trainable_params += num_params
+
+    print(
+        f"trainable params: {config.trainable_param_num:,d} || "
+        f"trainable neurons: {config.trainable_neuron_num:,d} || "
+        f"all params: {all_param:,d} || "
+        f"trainable%: {100 * config.trainable_param_num / all_param:.4f}"
+    )
