@@ -3,9 +3,9 @@ gpu_id=$1
 adversarial_method_name_array=(
     # "VirtualPersonas"
     "DeepInception"
-    "DAP"
     "Jailbroken"
     "SafeEditWithAdv"
+    "DAP"
     "MultiJail"
 )
 for adversarial_method_name in ${adversarial_method_name_array[@]}; do
